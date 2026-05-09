@@ -419,6 +419,20 @@ impl WorkerRef {
         }
     }
 
+    pub(crate) fn not_found(class: String) -> Self {
+        Self {
+            work_fn: Arc::new(Box::new(move |_args: JsonValue| {
+                let class = class.clone();
+                Box::pin(async move {
+                    Err(Error::Message(format!(
+                        "Worker not found for class: {class}"
+                    )))
+                })
+            })),
+            max_retries: 25,
+        }
+    }
+
     #[must_use]
     pub fn max_retries(&self) -> usize {
         self.max_retries

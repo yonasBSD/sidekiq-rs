@@ -202,7 +202,7 @@ impl Processor {
             tokio::task::yield_now().await;
             return Ok(WorkFetcher::NoWorkFound);
         }
-        let mut work = work.expect("polled and found some work");
+        let work = work.expect("polled and found some work");
 
         let started = std::time::Instant::now();
 
@@ -213,19 +213,15 @@ impl Processor {
             "jid" = &work.job.jid
         }, "sidekiq");
 
-        if let Some(worker) = self.workers.get_mut(&work.job.class) {
-            self.chain
-                .call(&work.job, worker.clone(), self.redis.clone())
-                .await?;
+        let worker = if let Some(worker) = self.workers.get(&work.job.class) {
+            worker.clone()
         } else {
-            error!({
-                "staus" = "fail",
-                "class" = &work.job.class,
-                "queue" = &work.job.queue,
-                "jid" = &work.job.jid
-            },"!!! Worker not found !!!");
-            work.reenqueue(&self.redis).await?;
-        }
+            Arc::new(WorkerRef::not_found(work.job.class.clone()))
+        };
+
+        self.chain
+            .call(&work.job, worker, self.redis.clone())
+            .await?;
 
         // TODO: Make this only say "done" when the job is successful.
         // We might need to change the ChainIter to return the final job and
