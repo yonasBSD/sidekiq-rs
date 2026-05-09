@@ -127,6 +127,21 @@ mod test {
 
         let n = sched.enqueue_jobs(future_date, &sets).await.unwrap();
         assert_eq!(n, 0, "dead job should not be re-enqueued");
+
+        // The job SHOULD be in the dead set
+        let mut conn = redis.get().await.unwrap();
+        let dead_jobs: Vec<String> = conn
+            .zrange("dead".to_string(), isize::MIN, isize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(dead_jobs.len(), 1, "dead job should be in the dead set");
+
+        let dead_job: serde_json::Value = serde_json::from_str(&dead_jobs[0]).unwrap();
+        assert_eq!(dead_job["class"], "AlwaysFailWorker");
+        assert!(
+            dead_job["error_message"].as_str().is_some(),
+            "dead job should have an error message"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -155,6 +170,14 @@ mod test {
 
         let n = sched.enqueue_jobs(future_date, &sets).await.unwrap();
         assert_eq!(n, 0, "retry=false should never enqueue a retry");
+
+        // retry=false jobs should still go to the dead set
+        let mut conn = redis.get().await.unwrap();
+        let dead_jobs: Vec<String> = conn
+            .zrange("dead".to_string(), isize::MIN, isize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(dead_jobs.len(), 1, "retry=false job should be in the dead set");
     }
 
     // -----------------------------------------------------------------------

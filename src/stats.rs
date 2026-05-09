@@ -64,7 +64,7 @@ pub struct StatsPublisher {
 fn generate_identity(hostname: &String) -> String {
     let pid = std::process::id();
     let mut bytes = [0u8; 12];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     let nonce = hex::encode(bytes);
 
     format!("{hostname}:{pid}:{nonce}")

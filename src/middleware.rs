@@ -188,12 +188,23 @@ impl ServerMiddleware for RetryMiddleware {
         // Attempt the retry.
         if retry_count > max_retries || job.retry == RetryOpts::Never {
             error!({
-                "status" = "fail",
+                "status" = "dead",
                 "class" = &job.class,
                 "jid" = &job.jid,
                 "queue" = &job.queue,
                 "err" = &job.error_message
-            }, "Max retries exceeded, will not reschedule job");
+            }, "Max retries exceeded, moving job to dead set");
+
+            // Add to the dead set so the job is visible in Sidekiq web UI.
+            let now = chrono::Utc::now().timestamp();
+            if let Err(err) = redis
+                .get()
+                .await?
+                .zadd("dead".to_string(), serde_json::to_string(&job)?, now)
+                .await
+            {
+                error!("Failed to add job to dead set: {:?}", err);
+            }
         } else {
             error!({
                 "status" = "fail",
