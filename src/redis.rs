@@ -178,6 +178,20 @@ impl RedisConnection {
         self.connection.sadd(self.namespaced_key(key), value).await
     }
 
+    pub async fn srem<V>(&mut self, key: String, value: V) -> Result<(), RedisError>
+    where
+        V: ToRedisArgs + Send + Sync,
+    {
+        self.connection.srem(self.namespaced_key(key), value).await
+    }
+
+    pub async fn unlink(&mut self, key: String) -> Result<(), RedisError> {
+        redis::cmd("UNLINK")
+            .arg(self.namespaced_key(key))
+            .query_async(self.unnamespaced_borrow_mut())
+            .await
+    }
+
     pub async fn set_nx_ex<V>(
         &mut self,
         key: String,

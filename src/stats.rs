@@ -135,6 +135,22 @@ impl StatsPublisher {
         Ok(())
     }
 
+    /// Remove this process from the `processes` set and delete the heartbeat hash.
+    ///
+    /// Mirrors Ruby Sidekiq's `Launcher#clear_heartbeat`, which pipelines:
+    ///   `SREM processes [identity]`
+    ///   `UNLINK identity:work`
+    ///
+    /// rusty-sidekiq does not maintain a per-process `:work` hash, so only the
+    /// set membership and the heartbeat hash itself are cleaned up here.
+    pub async fn deregister(&self, redis: RedisPool) -> Result<(), Box<dyn std::error::Error>> {
+        let mut conn = redis.get().await?;
+        conn.srem("processes".to_string(), self.identity.clone())
+            .await?;
+        conn.unlink(self.identity.clone()).await?;
+        Ok(())
+    }
+
     async fn create_process_stats(&self) -> Result<ProcessStats, Box<dyn std::error::Error>> {
         let rss_in_kb = format!("{}", get_rss_kb());
 
