@@ -135,6 +135,30 @@ impl StatsPublisher {
         Ok(())
     }
 
+    /// Remove this process from the `processes` set and delete the heartbeat hash.
+    ///
+    /// Mirrors Ruby Sidekiq's `Launcher#clear_heartbeat`, which pipelines:
+    ///   `SREM processes [identity]`
+    ///   `UNLINK identity:work`
+    ///
+    /// rusty-sidekiq does not maintain a per-process `:work` hash, so only the
+    /// set membership and the heartbeat hash itself are cleaned up here.
+    /// Both operations are sent in a single pipelined round-trip.
+    pub(crate) async fn deregister(&self, redis: RedisPool) -> crate::Result<()> {
+        let mut conn = redis.get().await?;
+        conn.srem_and_unlink(
+            "processes".to_string(),
+            self.identity.clone(),
+            self.identity.clone(),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub(crate) fn identity(&self) -> &str {
+        &self.identity
+    }
+
     async fn create_process_stats(&self) -> Result<ProcessStats, Box<dyn std::error::Error>> {
         let rss_in_kb = format!("{}", get_rss_kb());
 
@@ -197,4 +221,109 @@ fn get_rss_kb() -> u64 {
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn get_rss_kb() -> u64 {
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bb8::Pool;
+    use crate::RedisConnectionManager;
+
+    async fn test_pool() -> crate::RedisPool {
+        let manager = RedisConnectionManager::new("redis://127.0.0.1/").unwrap();
+        Pool::builder().build(manager).await.unwrap()
+    }
+
+    async fn sismember(redis: &RedisPool, set: &str, member: &str) -> bool {
+        let mut conn = redis.get().await.unwrap();
+        redis::cmd("SISMEMBER")
+            .arg(set)
+            .arg(member)
+            .query_async::<i64>(conn.unnamespaced_borrow_mut())
+            .await
+            .unwrap_or(0)
+            == 1
+    }
+
+    async fn exists(redis: &RedisPool, key: &str) -> bool {
+        let mut conn = redis.get().await.unwrap();
+        redis::cmd("EXISTS")
+            .arg(key)
+            .query_async::<i64>(conn.unnamespaced_borrow_mut())
+            .await
+            .unwrap_or(0)
+            > 0
+    }
+
+    fn new_publisher() -> StatsPublisher {
+        StatsPublisher::new(
+            "testhost".to_string(),
+            vec!["default".to_string()],
+            Counter::new(0),
+            1,
+        )
+    }
+
+    #[tokio::test]
+    async fn deregister_removes_identity_from_processes_set() {
+        let redis = test_pool().await;
+        let p = new_publisher();
+
+        p.publish_stats(redis.clone()).await.unwrap();
+        assert!(
+            sismember(&redis, "processes", p.identity()).await,
+            "should be in set after publish_stats"
+        );
+
+        p.deregister(redis.clone()).await.unwrap();
+        assert!(
+            !sismember(&redis, "processes", p.identity()).await,
+            "should be removed from set after deregister"
+        );
+    }
+
+    #[tokio::test]
+    async fn deregister_deletes_heartbeat_hash() {
+        let redis = test_pool().await;
+        let p = new_publisher();
+
+        p.publish_stats(redis.clone()).await.unwrap();
+        assert!(exists(&redis, p.identity()).await, "heartbeat hash should exist");
+
+        p.deregister(redis.clone()).await.unwrap();
+        assert!(
+            !exists(&redis, p.identity()).await,
+            "heartbeat hash should be deleted after deregister"
+        );
+    }
+
+    #[tokio::test]
+    async fn deregister_does_not_affect_sibling_process() {
+        let redis = test_pool().await;
+        let p1 = new_publisher();
+        let p2 = new_publisher(); // distinct nonce → distinct identity
+
+        p1.publish_stats(redis.clone()).await.unwrap();
+        p2.publish_stats(redis.clone()).await.unwrap();
+
+        p1.deregister(redis.clone()).await.unwrap();
+
+        assert!(
+            sismember(&redis, "processes", p2.identity()).await,
+            "sibling process must remain registered after p1 deregisters"
+        );
+
+        p2.deregister(redis.clone()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deregister_is_idempotent() {
+        let redis = test_pool().await;
+        let p = new_publisher();
+
+        p.publish_stats(redis.clone()).await.unwrap();
+        p.deregister(redis.clone()).await.unwrap();
+        // Second call must not error (SREM on missing member is a no-op in Redis)
+        p.deregister(redis.clone()).await.unwrap();
+    }
 }

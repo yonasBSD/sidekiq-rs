@@ -178,6 +178,36 @@ impl RedisConnection {
         self.connection.sadd(self.namespaced_key(key), value).await
     }
 
+    pub async fn srem<V>(&mut self, key: String, value: V) -> Result<(), RedisError>
+    where
+        V: ToRedisArgs + Send + Sync,
+    {
+        self.connection.srem(self.namespaced_key(key), value).await
+    }
+
+    pub async fn unlink(&mut self, key: String) -> Result<(), RedisError> {
+        let _: i64 = self.connection.unlink(self.namespaced_key(key)).await?;
+        Ok(())
+    }
+
+    /// Pipeline SREM + UNLINK in a single round-trip. Both keys are namespaced.
+    /// Equivalent to Ruby's `conn.pipelined { |p| p.srem(set, member); p.unlink(hash_key) }`.
+    pub async fn srem_and_unlink(
+        &mut self,
+        set_key: String,
+        member: String,
+        hash_key: String,
+    ) -> Result<(), RedisError> {
+        redis::pipe()
+            .cmd("SREM")
+            .arg(self.namespaced_key(set_key))
+            .arg(&member)
+            .cmd("UNLINK")
+            .arg(self.namespaced_key(hash_key))
+            .query_async::<()>(self.unnamespaced_borrow_mut())
+            .await
+    }
+
     pub async fn set_nx_ex<V>(
         &mut self,
         key: String,

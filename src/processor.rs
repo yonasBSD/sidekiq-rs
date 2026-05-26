@@ -353,7 +353,23 @@ impl Processor {
                     }
                 }
 
-                debug!("Broke out of loop web metrics");
+                // On graceful shutdown, remove the process from the `processes` set and
+                // delete the heartbeat hash. This mirrors Ruby Sidekiq's clear_heartbeat():
+                //   pipeline.srem("processes", [identity])
+                //   pipeline.unlink("#{identity}:work")
+                // Without this, stale entries accumulate in the `processes` set until the
+                // heartbeat hash's 60-second TTL expires — but the set membership has no TTL
+                // and never self-cleans.
+                let identity = stats_publisher.identity().to_string();
+                if let Err(err) = stats_publisher.deregister(redis.clone()).await {
+                    error!(
+                        identity = %identity,
+                        "Error deregistering processor from Redis on shutdown: {:?}",
+                        err
+                    );
+                }
+
+                debug!(identity = %identity, "Deregistered processor from Redis");
             }
         });
 
