@@ -73,6 +73,16 @@ fn generate_identity(hostname: &String) -> String {
     format!("{hostname}:{pid}:{nonce}")
 }
 
+/// A per-worker "thread id", used as the field key in the `<identity>:work`
+/// hash that backs the Sidekiq web "Busy" page. Mirrors Ruby's `Sidekiq.tid`
+/// (a short, process-unique token); generated once per worker so the same
+/// slot is reused as that worker churns through jobs.
+pub(crate) fn generate_tid() -> String {
+    let mut bytes = [0u8; 6];
+    rand::rng().fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
 impl StatsPublisher {
     #[must_use]
     pub fn new(
@@ -132,18 +142,25 @@ impl StatsPublisher {
         conn.sadd("processes".to_string(), self.identity.clone())
             .await?;
 
+        // Keep the WorkSet hash (written per-job in `Processor::process_one_tick_once`)
+        // on the same 60s heartbeat TTL, so a crashed process's in-flight entries
+        // self-expire and long-running jobs stay visible while the process is alive.
+        // EXPIRE on a missing key (no jobs in flight) is a harmless no-op.
+        conn.expire(format!("{}:work", self.identity), 60).await?;
+
         Ok(())
     }
 
-    /// Remove this process from the `processes` set and delete the heartbeat hash.
+    /// Remove this process from the `processes` set and delete the heartbeat hash
+    /// and the WorkSet (`<identity>:work`).
     ///
     /// Mirrors Ruby Sidekiq's `Launcher#clear_heartbeat`, which pipelines:
     ///   `SREM processes [identity]`
     ///   `UNLINK identity:work`
     ///
-    /// rusty-sidekiq does not maintain a per-process `:work` hash, so only the
-    /// set membership and the heartbeat hash itself are cleaned up here.
-    /// Both operations are sent in a single pipelined round-trip.
+    /// Without this, stale entries accumulate in the `processes` set until the
+    /// heartbeat hash's 60s TTL expires — but the set membership has no TTL and
+    /// never self-cleans.
     pub(crate) async fn deregister(&self, redis: RedisPool) -> crate::Result<()> {
         let mut conn = redis.get().await?;
         conn.srem_and_unlink(
@@ -152,6 +169,7 @@ impl StatsPublisher {
             self.identity.clone(),
         )
         .await?;
+        conn.unlink(format!("{}:work", self.identity)).await?;
         Ok(())
     }
 
