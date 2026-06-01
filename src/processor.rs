@@ -1,4 +1,5 @@
 use super::Result;
+use crate::stats::generate_tid;
 use crate::{
     periodic::PeriodicJob, Chain, Counter, Job, RedisPool, Scheduled, ServerMiddleware,
     StatsPublisher, UnitOfWork, Worker, WorkerRef,
@@ -27,6 +28,12 @@ pub struct Processor {
     busy_jobs: Counter,
     cancellation_token: CancellationToken,
     config: ProcessorConfig,
+    // Sidekiq-web WorkSet bookkeeping. Both are assigned per-worker by `run()`;
+    // when unset (e.g. a bare `process_one()` call), WorkSet publishing is
+    // skipped. `identity` is the shared process identity (the same one the
+    // heartbeat registers in `processes`); `tid` is this worker's thread id.
+    identity: Option<String>,
+    tid: Option<String>,
 }
 
 #[derive(Clone)]
@@ -139,6 +146,8 @@ impl Processor {
             human_readable_queues: queues,
             cancellation_token: CancellationToken::new(),
             config: Default::default(),
+            identity: None,
+            tid: None,
         }
     }
 
@@ -219,9 +228,15 @@ impl Processor {
             Arc::new(WorkerRef::not_found(work.job.class.clone()))
         };
 
-        self.chain
+        // Publish this job to the Sidekiq WorkSet (`<identity>:work`) so it shows
+        // on the web "Busy" page, then clear it whether the job succeeds or fails.
+        self.set_work(&work).await;
+        let result = self
+            .chain
             .call(&work.job, worker, self.redis.clone())
-            .await?;
+            .await;
+        self.clear_work().await;
+        result?;
 
         // TODO: Make this only say "done" when the job is successful.
         // We might need to change the ChainIter to return the final job and
@@ -234,6 +249,49 @@ impl Processor {
             "jid" = &work.job.jid}, "sidekiq");
 
         Ok(WorkFetcher::Done)
+    }
+
+    /// Record an in-flight job in this process's Sidekiq WorkSet
+    /// (`<identity>:work`) so it shows on the web UI "Busy" page. Best-effort:
+    /// any Redis error is logged and never interrupts job processing. A no-op
+    /// unless an `identity` + `tid` were assigned (i.e. running under `run()`).
+    async fn set_work(&self, work: &UnitOfWork) {
+        let (Some(identity), Some(tid)) = (self.identity.as_deref(), self.tid.as_deref()) else {
+            return;
+        };
+
+        let result: Result<()> = async {
+            let key = format!("{identity}:work");
+            let mut conn = self.redis.get().await?;
+            conn.hset(key.clone(), tid.to_string(), work_record(&work.job)?)
+                .await?;
+            conn.expire(key, 60).await?;
+            Ok(())
+        }
+        .await;
+
+        if let Err(err) = result {
+            error!("Error recording sidekiq work state: {:?}", err);
+        }
+    }
+
+    /// Clear this worker's WorkSet entry once the job finishes (success or fail).
+    async fn clear_work(&self) {
+        let (Some(identity), Some(tid)) = (self.identity.as_deref(), self.tid.as_deref()) else {
+            return;
+        };
+
+        let result: Result<()> = async {
+            let mut conn = self.redis.get().await?;
+            conn.hdel(format!("{identity}:work"), tid.to_string())
+                .await?;
+            Ok(())
+        }
+        .await;
+
+        if let Err(err) = result {
+            error!("Error clearing sidekiq work state: {:?}", err);
+        }
     }
 
     pub fn register<
@@ -273,6 +331,24 @@ impl Processor {
     pub async fn run(self) {
         let mut join_set: JoinSet<()> = JoinSet::new();
 
+        // Build the stats publisher up front so its process identity can be shared
+        // with the workers: each worker records its in-flight job under that
+        // identity's WorkSet (`<identity>:work`) — the same identity the heartbeat
+        // registers in the `processes` set — so the web "Busy" page lists running
+        // jobs against this process.
+        let hostname = if let Some(host) = gethostname::gethostname().to_str() {
+            host.to_string()
+        } else {
+            "UNKNOWN_HOSTNAME".to_string()
+        };
+        let stats_publisher = StatsPublisher::new(
+            hostname,
+            self.human_readable_queues.clone(),
+            self.busy_jobs.clone(),
+            self.config.num_workers,
+        );
+        let identity = stats_publisher.identity().to_string();
+
         // Logic for spawning shared workers (workers that handles multiple queues) and dedicated
         // workers (workers that handle a single queue).
         let spawn_worker = |mut processor: Processor,
@@ -299,8 +375,11 @@ impl Processor {
 
         // Start worker routines.
         for i in 0..self.config.num_workers {
+            let mut processor = self.clone();
+            processor.identity = Some(identity.clone());
+            processor.tid = Some(generate_tid());
             join_set.spawn(spawn_worker(
-                self.clone(),
+                processor,
                 self.cancellation_token.clone(),
                 i,
                 None,
@@ -313,6 +392,8 @@ impl Processor {
                 join_set.spawn({
                     let mut processor = self.clone();
                     processor.queues = [queue.clone()].into();
+                    processor.identity = Some(identity.clone());
+                    processor.tid = Some(generate_tid());
                     spawn_worker(
                         processor,
                         self.cancellation_token.clone(),
@@ -323,22 +404,12 @@ impl Processor {
             }
         }
 
-        // Start sidekiq-web metrics publisher.
+        // Start sidekiq-web metrics publisher. Consumes the `stats_publisher` built
+        // above (whose identity the workers share for the WorkSet).
         join_set.spawn({
             let redis = self.redis.clone();
-            let queues = self.human_readable_queues.clone();
-            let busy_jobs = self.busy_jobs.clone();
             let cancellation_token = self.cancellation_token.clone();
             async move {
-                let hostname = if let Some(host) = gethostname::gethostname().to_str() {
-                    host.to_string()
-                } else {
-                    "UNKNOWN_HOSTNAME".to_string()
-                };
-
-                let stats_publisher =
-                    StatsPublisher::new(hostname, queues, busy_jobs, self.config.num_workers);
-
                 loop {
                     // TODO: Use process count to meet a 5 second avg.
                     select! {
@@ -436,5 +507,46 @@ impl Processor {
         M: ServerMiddleware + Send + Sync + 'static,
     {
         self.chain.using(Box::new(middleware)).await;
+    }
+}
+
+/// Build the value stored in the `<identity>:work` hash for an in-flight job,
+/// matching Ruby Sidekiq's `{queue, payload, run_at}` work record. `payload` is
+/// the job JSON as a *string*, exactly as Sidekiq stores it and the web UI
+/// expects it (`Sidekiq.load_json(work.payload)`).
+fn work_record(job: &Job) -> Result<String> {
+    let record = serde_json::json!({
+        "queue": job.queue,
+        "payload": serde_json::to_string(job)?,
+        "run_at": chrono::Utc::now().timestamp(),
+    });
+
+    Ok(record.to_string())
+}
+
+#[cfg(test)]
+mod work_set_tests {
+    use super::*;
+
+    #[test]
+    fn work_record_matches_sidekiq_shape() {
+        let job: Job = serde_json::from_str(
+            r#"{"queue":"default","args":[1,"x"],"retry":true,"class":"HardWorker","jid":"abc123","created_at":1700000000.0}"#,
+        )
+        .expect("parse job");
+
+        let record: serde_json::Value =
+            serde_json::from_str(&work_record(&job).expect("build record")).expect("parse record");
+
+        assert_eq!(record["queue"], "default");
+        assert!(record["run_at"].is_number());
+
+        // `payload` must be a JSON *string* (the job JSON), not a nested object.
+        let payload = record["payload"].as_str().expect("payload is a string");
+        let payload: serde_json::Value = serde_json::from_str(payload).expect("parse payload");
+        assert_eq!(payload["class"], "HardWorker");
+        assert_eq!(payload["jid"], "abc123");
+        assert_eq!(payload["args"][1], "x");
+        assert!(payload["args"][0].is_number());
     }
 }
